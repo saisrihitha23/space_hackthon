@@ -1,261 +1,1268 @@
-/* =========================================================
-   ORBITAL SENTINEL
-   SPACECRAFT TELEMETRY MONITOR
-   Demo Flow:
-
-   NORMAL
-      ↓
-   WARNING
-      ↓
-   ANOMALY
-      ↓
-   RECOVERY
-      ↓
-   NORMAL
-========================================================= */
-
-
-/* =========================================================
-   SETTINGS
-========================================================= */
-
 const MAX_POINTS = 60;
 
-// Demo timing
-const NORMAL_TIME = 15000;
-const WARNING_TIME = 8000;
-const ANOMALY_TIME = 10000;
-const RECOVERY_TIME = 10000;
-
-
-/* =========================================================
-   SYSTEM STATE
-========================================================= */
-
+let usingRealML = false;
 let systemPhase = "normal";
-
-let anomalyDetected = false;
-
-let anomalyRecorded = false;
-
 let phaseTimer = null;
 
+let dynamicThreshold = 0.43;
 
-/* =========================================================
-   TELEMETRY
-========================================================= */
+let selectedPoint = null;
 
 let telemetry = {
-
     temperature: 32.4,
     voltage: 3.72,
     current: 1.21,
     solar: 4.52,
     anomalyScore: 0.10
+};
 
+const NORMAL = {
+    temperature: 32.4,
+    voltage: 3.72,
+    current: 1.21,
+    solar: 4.52
+};
+
+const history = {
+    temperature: [],
+    voltage: [],
+    current: [],
+    solar: [],
+    anomalyScore: [],
+    timestamps: [],
+    anomalyFlags: []
+};
+
+const mlData = {
+    anomalies: [],
+    timeline: [],
+    reconstructionErrors: [],
+    featureTimeline: [],
+    finalResults: []
+};
+
+const canvases = {
+    temperature: document.getElementById("temperatureChart"),
+    voltage: document.getElementById("voltageChart"),
+    current: document.getElementById("currentChart"),
+    solar: document.getElementById("solarChart"),
+    anomalyScore: document.getElementById("anomalyChart")
 };
 
 
 /* =========================================================
-   NORMAL VALUES
+   HELPERS
 ========================================================= */
 
-const NORMAL = {
+function setText(id, value) {
+    const element = document.getElementById(id);
 
-    temperature: 32.4,
-    voltage: 3.72,
-    current: 1.21,
-    solar: 4.52,
-    anomalyScore: 0.10
+    if (element) {
+        element.textContent = value;
+    }
+}
 
-};
+function getValue(object, names, fallback = null) {
+    if (!object) {
+        return fallback;
+    }
+
+    for (const name of names) {
+        if (
+            object[name] !== undefined &&
+            object[name] !== null
+        ) {
+            return object[name];
+        }
+    }
+
+    return fallback;
+}
+
+function getNumber(object, names, fallback = null) {
+    const value = getValue(object, names, fallback);
+    const number = Number(value);
+
+    return Number.isFinite(number)
+        ? number
+        : fallback;
+}
+
+function normalizeArray(data) {
+    if (Array.isArray(data)) {
+        return data;
+    }
+
+    if (data && typeof data === "object") {
+
+        for (
+            const key of [
+                "data",
+                "results",
+                "records",
+                "items"
+            ]
+        ) {
+
+            if (Array.isArray(data[key])) {
+                return data[key];
+            }
+        }
+    }
+
+    return [];
+}
+
+function formatTime(value) {
+
+    if (!value) {
+        return new Date().toLocaleTimeString();
+    }
+
+    const date = new Date(value);
+
+    if (!Number.isNaN(date.getTime())) {
+        return date.toLocaleString();
+    }
+
+    return String(value);
+}
+
+function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+}
+
+
+/* =========================================================
+   ML STATUS
+========================================================= */
+
+function setMLStatus(message) {
+    setText("mlDataStatus", message);
+}
+
+function setConnected(connected) {
+
+    const dot =
+        document.getElementById("connectionDot");
+
+    const text =
+        document.getElementById("connectionText");
+
+    if (connected) {
+
+        dot.style.background = "#34d399";
+        dot.style.boxShadow = "0 0 12px #34d399";
+
+        text.textContent = "AI CONNECTED";
+
+    } else {
+
+        dot.style.background = "#facc15";
+        dot.style.boxShadow = "0 0 12px #facc15";
+
+        text.textContent = "DEMO MODE";
+    }
+}
+
+
+/* =========================================================
+   LOAD ML DATA
+========================================================= */
+
+async function loadRealMLData() {
+
+    try {
+
+        setMLStatus("🤖 LOADING PS1 RESULTS...");
+
+        const response =
+            await fetch(
+                "/api/results",
+                {
+                    cache: "no-store"
+                }
+            );
+
+        if (!response.ok) {
+            throw new Error("API failed");
+        }
+
+        const data =
+            await response.json();
+
+        mlData.anomalies =
+            normalizeArray(data.anomalies);
+
+        mlData.timeline =
+            normalizeArray(data.timeline);
+
+        mlData.reconstructionErrors =
+            normalizeArray(
+                data.reconstruction_errors
+            );
+
+        mlData.featureTimeline =
+            normalizeArray(
+                data.feature_timeline
+            );
+
+        mlData.finalResults =
+            normalizeArray(
+                data.final_results
+            );
+
+        const rows = getTelemetryRows();
+
+        if (!rows.length) {
+
+            setMLStatus("🛰️ DEMO MODE");
+
+            setConnected(false);
+
+            startDemoMode();
+
+            return;
+        }
+
+        usingRealML = true;
+
+        setMLStatus("🧠 REAL ML DATA CONNECTED");
+
+        setConnected(true);
+
+        processRealData();
+
+    } catch (error) {
+
+        console.error(error);
+
+        setMLStatus("🛰️ DEMO MODE");
+
+        setConnected(false);
+
+        startDemoMode();
+    }
+}
+
+
+/* =========================================================
+   GET TELEMETRY
+========================================================= */
+
+function getTelemetryRows() {
+
+    if (mlData.timeline.length) {
+        return mlData.timeline;
+    }
+
+    if (mlData.finalResults.length) {
+        return mlData.finalResults;
+    }
+
+    if (mlData.reconstructionErrors.length) {
+        return mlData.reconstructionErrors;
+    }
+
+    return [];
+}
+
+
+/* =========================================================
+   PROCESS REAL DATA
+========================================================= */
+
+function processRealData() {
+
+    const rows = getTelemetryRows();
+
+    rows.forEach((row, index) => {
+
+        const temperature =
+            getNumber(
+                row,
+                [
+                    "temperature",
+                    "Temperature",
+                    "temp",
+                    "TEMP"
+                ]
+            );
+
+        const voltage =
+            getNumber(
+                row,
+                [
+                    "voltage",
+                    "Voltage",
+                    "battery_voltage",
+                    "V"
+                ]
+            );
+
+        const current =
+            getNumber(
+                row,
+                [
+                    "current",
+                    "Current",
+                    "battery_current",
+                    "I"
+                ]
+            );
+
+        const solar =
+            getNumber(
+                row,
+                [
+                    "solar",
+                    "Solar",
+                    "solar_power",
+                    "SOLAR"
+                ]
+            );
+
+        const score =
+            getNumber(
+                row,
+                [
+                    "anomaly_score",
+                    "anomalyScore",
+                    "score",
+                    "reconstruction_error",
+                    "reconstructionError",
+                    "error"
+                ],
+                0
+            );
+
+        const timestamp =
+            getValue(
+                row,
+                [
+                    "timestamp",
+                    "datetime",
+                    "time",
+                    "date"
+                ],
+                index
+            );
+
+        history.temperature.push(
+            temperature ?? NORMAL.temperature
+        );
+
+        history.voltage.push(
+            voltage ?? NORMAL.voltage
+        );
+
+        history.current.push(
+            current ?? NORMAL.current
+        );
+
+        history.solar.push(
+            solar ?? NORMAL.solar
+        );
+
+        history.anomalyScore.push(score);
+
+        history.timestamps.push(timestamp);
+
+        history.anomalyFlags.push(
+            score > dynamicThreshold
+        );
+    });
+
+    trimHistory();
+
+    calculateDynamicThreshold();
+
+    updateLatestTelemetry();
+
+    updateUI();
+
+    drawAllCharts();
+
+    processRealAnomalies();
+
+    populateTerminalFromRealData();
+}
+
+
+/* =========================================================
+   DYNAMIC NDT
+========================================================= */
+
+function calculateDynamicThreshold() {
+
+    const scores =
+        history.anomalyScore
+            .filter(Number.isFinite);
+
+    if (scores.length < 5) {
+        return;
+    }
+
+    const sorted =
+        [...scores].sort(
+            (a, b) => a - b
+        );
+
+    const percentileIndex =
+        Math.floor(
+            sorted.length * 0.90
+        );
+
+    dynamicThreshold =
+        sorted[
+            Math.min(
+                percentileIndex,
+                sorted.length - 1
+            )
+        ];
+
+    dynamicThreshold =
+        clamp(
+            dynamicThreshold,
+            0.05,
+            0.95
+        );
+}
 
 
 /* =========================================================
    HISTORY
 ========================================================= */
 
-const history = {
+function trimHistory() {
 
-    temperature: [],
-    voltage: [],
-    current: [],
-    solar: [],
-    anomalyScore: []
+    Object.keys(history).forEach(key => {
 
-};
+        history[key] =
+            history[key].slice(-MAX_POINTS);
 
-
-/* =========================================================
-   ANOMALY HISTORY
-========================================================= */
-
-let anomalyHistory = [];
-
-
-/* =========================================================
-   DYNAMIC THRESHOLD
-========================================================= */
-
-let dynamicThreshold = 0.43;
-
-
-/* =========================================================
-   INITIAL DATA
-========================================================= */
-
-for (let i = 0; i < MAX_POINTS; i++) {
-
-    history.temperature.push(
-        31.8 + Math.random() * 1.2
-    );
-
-    history.voltage.push(
-        3.68 + Math.random() * 0.06
-    );
-
-    history.current.push(
-        1.10 + Math.random() * 0.15
-    );
-
-    history.solar.push(
-        4.25 + Math.random() * 0.45
-    );
-
-    history.anomalyScore.push(
-        0.08 + Math.random() * 0.05
-    );
-
+    });
 }
 
 
 /* =========================================================
-   CHART SETTINGS
+   LATEST VALUES
 ========================================================= */
 
-const chartSettings = {
+function updateLatestTelemetry() {
 
-    temperature: {
-        min: 25,
-        max: 45,
-        threshold: 40,
-        unit: "°C",
-        color: "#38bdf8"
-    },
+    const last = array =>
+        array.length
+            ? array[array.length - 1]
+            : null;
 
-    voltage: {
-        min: 3.2,
-        max: 4,
-        threshold: 3.4,
-        unit: "V",
-        color: "#a78bfa"
-    },
+    telemetry.temperature =
+        last(history.temperature)
+        ?? telemetry.temperature;
 
-    current: {
-        min: 0.7,
-        max: 2,
-        threshold: 1.7,
-        unit: "A",
-        color: "#fb923c"
-    },
+    telemetry.voltage =
+        last(history.voltage)
+        ?? telemetry.voltage;
 
-    solar: {
-        min: 1.5,
-        max: 5.5,
-        threshold: 2.5,
-        unit: "W",
-        color: "#facc15"
-    },
+    telemetry.current =
+        last(history.current)
+        ?? telemetry.current;
 
-    anomalyScore: {
-        min: 0,
-        max: 1,
-        threshold: dynamicThreshold,
-        unit: "",
-        color: "#f87171"
+    telemetry.solar =
+        last(history.solar)
+        ?? telemetry.solar;
+
+    telemetry.anomalyScore =
+        last(history.anomalyScore)
+        ?? telemetry.anomalyScore;
+}
+
+
+/* =========================================================
+   ANOMALY SEVERITY
+========================================================= */
+
+function getSeverity(score) {
+
+    if (score >= 0.75) {
+        return "HIGH";
     }
 
-};
+    if (score >= 0.50) {
+        return "WARNING";
+    }
+
+    if (score >= 0.30) {
+        return "WATCH";
+    }
+
+    return "LOW";
+}
 
 
 /* =========================================================
-   CANVAS
+   CHANNEL ANALYSIS
 ========================================================= */
 
-const canvases = {
+function analyzeChannels(values) {
 
-    temperature:
-        document.getElementById("temperatureChart"),
+    const analysis = [];
 
-    voltage:
-        document.getElementById("voltageChart"),
+    const temperature =
+        Number(values.temperature);
 
-    current:
-        document.getElementById("currentChart"),
+    const voltage =
+        Number(values.voltage);
 
-    solar:
-        document.getElementById("solarChart"),
+    const current =
+        Number(values.current);
 
-    anomalyScore:
-        document.getElementById("anomalyChart")
+    const solar =
+        Number(values.solar);
 
-};
+
+    const tempDelta =
+        temperature - NORMAL.temperature;
+
+    const voltageDelta =
+        voltage - NORMAL.voltage;
+
+    const currentDelta =
+        current - NORMAL.current;
+
+    const solarDelta =
+        solar - NORMAL.solar;
+
+
+    /*
+       Temperature
+    */
+
+    if (tempDelta > 1.2) {
+
+        analysis.push({
+            key: "temperature",
+            label: "Temperature ↑",
+            strength: Math.abs(tempDelta),
+            direction: "up"
+        });
+
+    } else if (tempDelta < -1.2) {
+
+        analysis.push({
+            key: "temperature",
+            label: "Temperature ↓",
+            strength: Math.abs(tempDelta),
+            direction: "down"
+        });
+    }
+
+
+    /*
+       Voltage
+    */
+
+    if (voltageDelta < -0.08) {
+
+        analysis.push({
+            key: "voltage",
+            label: "Battery voltage ↓",
+            strength: Math.abs(voltageDelta),
+            direction: "down"
+        });
+
+    } else if (voltageDelta > 0.08) {
+
+        analysis.push({
+            key: "voltage",
+            label: "Battery voltage ↑",
+            strength: Math.abs(voltageDelta),
+            direction: "up"
+        });
+    }
+
+
+    /*
+       Current
+    */
+
+    if (currentDelta > 0.18) {
+
+        analysis.push({
+            key: "current",
+            label: "Current ↑",
+            strength: Math.abs(currentDelta),
+            direction: "up"
+        });
+
+    } else if (currentDelta < -0.18) {
+
+        analysis.push({
+            key: "current",
+            label: "Current ↓",
+            strength: Math.abs(currentDelta),
+            direction: "down"
+        });
+    }
+
+
+    /*
+       Solar
+    */
+
+    if (solarDelta < -0.35) {
+
+        analysis.push({
+            key: "solar",
+            label: "Solar power ↓",
+            strength: Math.abs(solarDelta),
+            direction: "down"
+        });
+
+    } else if (solarDelta > 0.35) {
+
+        analysis.push({
+            key: "solar",
+            label: "Solar power ↑",
+            strength: Math.abs(solarDelta),
+            direction: "up"
+        });
+    }
+
+
+    analysis.sort(
+        (a, b) =>
+            b.strength - a.strength
+    );
+
+
+    return analysis;
+}
 
 
 /* =========================================================
-   DRAW CHART
+   SUBSYSTEM DETECTION
 ========================================================= */
 
-function drawChart(canvas, values, config) {
+function detectSubsystem(contributors) {
 
-    if (!canvas) return;
+    const keys =
+        contributors.map(
+            item => item.key
+        );
 
-    const rect = canvas.getBoundingClientRect();
 
-    const width = Math.max(rect.width, 250);
+    if (
+        keys.includes("temperature")
+    ) {
 
-    const height = 170;
+        if (
+            keys.includes("voltage") ||
+            keys.includes("current")
+        ) {
 
-    const dpr = window.devicePixelRatio || 1;
+            return {
+                name: "Power + Thermal Subsystem",
+                icon: "⚡🌡️"
+            };
+        }
 
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
+        return {
+            name: "Thermal Subsystem",
+            icon: "🌡️"
+        };
+    }
 
-    const ctx = canvas.getContext("2d");
+
+    if (
+        keys.includes("voltage") ||
+        keys.includes("current")
+    ) {
+
+        return {
+            name: "Power Subsystem",
+            icon: "⚡"
+        };
+    }
+
+
+    if (
+        keys.includes("solar")
+    ) {
+
+        return {
+            name: "Solar Power Subsystem",
+            icon: "☀️"
+        };
+    }
+
+
+    return {
+        name: "Spacecraft Health",
+        icon: "🛰️"
+    };
+}
+
+
+/* =========================================================
+   DYNAMIC RECOMMENDATION
+========================================================= */
+
+function generateRecommendation(
+    contributors
+) {
+
+    const keys =
+        contributors.map(
+            item => item.key
+        );
+
+    const has =
+        key => keys.includes(key);
+
+
+    /*
+       THERMAL
+    */
+
+    if (
+        has("temperature") &&
+        !has("voltage") &&
+        !has("solar") &&
+        !has("current")
+    ) {
+
+        return {
+
+            main:
+                "🌡️ Reduce thermal load and monitor the thermal-control subsystem.",
+
+            actions: [
+                "🌡️ Monitor the temperature trend continuously.",
+                "⚙️ Reduce non-critical subsystem activity.",
+                "🛰️ Verify thermal-control subsystem status.",
+                "☀️ Check whether solar exposure is contributing to heating.",
+                "🚨 Prepare a safe thermal operating mode if the rise continues."
+            ],
+
+            reason:
+                "Temperature has moved away from its learned normal behavior. Reducing system activity can help limit additional heat generation while the thermal subsystem is checked."
+        };
+    }
+
+
+    /*
+       SOLAR
+    */
+
+    if (
+        has("solar") &&
+        !has("voltage") &&
+        !has("current")
+    ) {
+
+        return {
+
+            main:
+                "☀️ Verify solar-panel generation and spacecraft orientation.",
+
+            actions: [
+                "☀️ Check solar-panel power generation.",
+                "🛰️ Verify spacecraft orientation relative to the Sun.",
+                "📡 Check solar telemetry for persistent degradation.",
+                "🔋 Monitor battery state while generation is reduced.",
+                "🚨 Prioritize essential loads if solar generation continues falling."
+            ],
+
+            reason:
+                "Solar power has deviated from the spacecraft's learned normal behavior. A reduction in generation can eventually affect available spacecraft power."
+        };
+    }
+
+
+    /*
+       BATTERY
+    */
+
+    if (
+        has("voltage") &&
+        !has("current") &&
+        !has("solar")
+    ) {
+
+        return {
+
+            main:
+                "🔋 Monitor battery health and reduce unnecessary electrical load.",
+
+            actions: [
+                "🔋 Check battery voltage and state of charge.",
+                "⚡ Reduce non-essential power consumption.",
+                "📊 Monitor the battery trend for continued deviation.",
+                "🛰️ Verify battery-management telemetry.",
+                "🚨 Prepare backup power mode if degradation persists."
+            ],
+
+            reason:
+                "Battery voltage is outside the learned normal pattern. Continued deviation could indicate abnormal discharge or charging behavior."
+        };
+    }
+
+
+    /*
+       CURRENT / LOAD
+    */
+
+    if (
+        has("current") &&
+        !has("voltage") &&
+        !has("solar")
+    ) {
+
+        return {
+
+            main:
+                "⚡ Reduce non-critical electrical loads and investigate unusual current demand.",
+
+            actions: [
+                "⚡ Reduce non-essential subsystem activity.",
+                "🔎 Check which subsystem is drawing additional current.",
+                "🔋 Monitor battery voltage during the increased load.",
+                "📊 Continue observing the anomaly score.",
+                "🚨 Escalate to safe operating mode if the load persists."
+            ],
+
+            reason:
+                "Current consumption has moved outside the learned normal pattern, which may indicate an unexpected subsystem load."
+        };
+    }
+
+
+    /*
+       POWER COMBINATION
+    */
+
+    if (
+        has("voltage") &&
+        has("current") &&
+        has("solar")
+    ) {
+
+        return {
+
+            main:
+                "⚡ Reduce non-critical power loads and prioritize battery recovery.",
+
+            actions: [
+                "🔋 Check battery voltage and charging state.",
+                "☀️ Verify solar-panel power generation.",
+                "⚡ Reduce non-essential subsystem power consumption.",
+                "🌡️ Continue monitoring temperature for further increase.",
+                "🛰️ If the anomaly persists, prepare a safe/backup operating mode."
+            ],
+
+            reason:
+                "Battery voltage and solar generation are changing while current demand is also deviating. This combination may indicate a power imbalance or changing spacecraft load."
+        };
+    }
+
+
+    /*
+       THERMAL + POWER
+    */
+
+    if (
+        has("temperature") &&
+        (
+            has("voltage") ||
+            has("current")
+        )
+    ) {
+
+        return {
+
+            main:
+                "🌡️⚡ Reduce spacecraft load while monitoring thermal and power behavior.",
+
+            actions: [
+                "⚡ Reduce non-critical electrical loads.",
+                "🌡️ Monitor temperature continuously.",
+                "🔋 Check battery voltage and state of charge.",
+                "☀️ Verify solar generation.",
+                "🛰️ Prepare safe operating mode if both trends continue."
+            ],
+
+            reason:
+                "Thermal and electrical telemetry are deviating together. This combination can indicate increased system load or a subsystem operating outside its normal regime."
+        };
+    }
+
+
+    /*
+       GENERIC
+    */
+
+    return {
+
+        main:
+            "🛰️ Isolate the contributing subsystem and continue monitoring the telemetry trend.",
+
+        actions: [
+            "🔎 Inspect the telemetry channels contributing to the anomaly.",
+            "📊 Continue monitoring the anomaly score.",
+            "⚙️ Reduce non-critical subsystem activity.",
+            "🛰️ Verify the affected subsystem health.",
+            "🚨 Escalate to safe operating mode if the anomaly persists."
+        ],
+
+        reason:
+            "The AI detected a multivariate deviation from the spacecraft's learned normal behavior."
+    };
+}
+
+
+/* =========================================================
+   CREATE ANOMALY EVENT
+========================================================= */
+
+function createDynamicEvent(
+    score,
+    timestamp,
+    telemetryValues
+) {
+
+    const contributors =
+        analyzeChannels(
+            telemetryValues
+        );
+
+
+    const subsystem =
+        detectSubsystem(
+            contributors
+        );
+
+
+    const severity =
+        getSeverity(score);
+
+
+    return {
+
+        score,
+
+        timestamp,
+
+        severity,
+
+        contributors,
+
+        subsystem,
+
+        recommendation:
+            generateRecommendation(
+                contributors
+            )
+    };
+}
+
+
+/* =========================================================
+   SHOW ANOMALY
+========================================================= */
+
+function showDynamicAnomaly(event) {
+
+    setText(
+        "latestLocation",
+        `${event.subsystem.icon} ${event.subsystem.name}`
+    );
+
+    setText(
+        "latestTime",
+        formatTime(event.timestamp)
+    );
+
+    setText(
+        "latestSeverity",
+        event.severity
+    );
+
+    setText(
+        "latestScore",
+        event.score.toFixed(3)
+    );
+
+
+    const labels =
+        event.contributors.length
+            ? event.contributors.map(
+                item => item.label
+            )
+            : [
+                "Multivariate telemetry deviation"
+            ];
+
+
+    setText(
+        "latestExplanation",
+        `The AI detected a deviation involving ${labels.join(", ")}.`
+    );
+
+
+    setText(
+        "recommendedAction",
+        event.recommendation.main
+    );
+
+
+    const list =
+        document.getElementById(
+            "actionList"
+        );
+
+    list.innerHTML = "";
+
+
+    event.recommendation.actions.forEach(
+        action => {
+
+            const item =
+                document.createElement(
+                    "div"
+                );
+
+            item.className =
+                "action-item";
+
+            item.textContent =
+                action;
+
+            list.appendChild(item);
+        }
+    );
+
+
+    setText(
+        "actionReason",
+        event.recommendation.reason
+    );
+
+
+    document
+        .getElementById("actionBox")
+        .classList.remove("hidden");
+
+
+    setText(
+        "heroStatus",
+        "ANOMALY DETECTED"
+    );
+
+    setText(
+        "heroMessage",
+        `AI detected an unusual pattern in the ${event.subsystem.name}.`
+    );
+
+    setText(
+        "systemStatus",
+        "● ALERT"
+    );
+
+    setText(
+        "spacecraftState",
+        "● ANOMALY"
+    );
+
+    setText(
+        "riskLevel",
+        event.severity
+    );
+
+
+    document.body.classList.remove(
+        "warning-mode"
+    );
+
+    document.body.classList.add(
+        "anomaly-mode"
+    );
+
+
+    const health =
+        Math.round(
+            clamp(
+                100 -
+                event.score * 45,
+                35,
+                99
+            )
+        );
+
+    setText(
+        "healthValue",
+        health
+    );
+}
+
+
+/* =========================================================
+   NORMAL
+========================================================= */
+
+function showNormalStatus() {
+
+    setText(
+        "heroStatus",
+        "SYSTEM NOMINAL"
+    );
+
+    setText(
+        "heroMessage",
+        "All monitored telemetry is within the learned normal pattern."
+    );
+
+    setText(
+        "systemStatus",
+        "● ONLINE"
+    );
+
+    setText(
+        "spacecraftState",
+        "● NOMINAL"
+    );
+
+    setText(
+        "riskLevel",
+        "LOW"
+    );
+
+    setText(
+        "healthValue",
+        "94"
+    );
+
+    document.body.classList.remove(
+        "warning-mode",
+        "anomaly-mode"
+    );
+}
+
+
+/* =========================================================
+   UI
+========================================================= */
+
+function updateUI() {
+
+    setText(
+        "temperatureValue",
+        `${telemetry.temperature.toFixed(2)} °C`
+    );
+
+    setText(
+        "voltageValue",
+        `${telemetry.voltage.toFixed(3)} V`
+    );
+
+    setText(
+        "currentValue",
+        `${telemetry.current.toFixed(3)} A`
+    );
+
+    setText(
+        "solarValue",
+        `${telemetry.solar.toFixed(3)} W`
+    );
+
+    setText(
+        "anomalyValue",
+        telemetry.anomalyScore.toFixed(3)
+    );
+
+    setText(
+        "ndtThreshold",
+        dynamicThreshold.toFixed(3)
+    );
+
+    setText(
+        "riskLevel",
+        getSeverity(
+            telemetry.anomalyScore
+        )
+    );
+}
+
+
+/* =========================================================
+   INTERACTIVE CANVAS CHART
+========================================================= */
+
+function drawInteractiveChart(
+    canvas,
+    values,
+    timestamps,
+    scores,
+    config,
+    tooltip
+) {
+
+    if (!canvas || values.length < 2) {
+        return;
+    }
+
+
+    const rect =
+        canvas.getBoundingClientRect();
+
+    const width =
+        Math.max(rect.width, 240);
+
+    const height =
+        canvas.id === "anomalyChart"
+            ? 230
+            : 115;
+
+    const dpr =
+        window.devicePixelRatio || 1;
+
+    canvas.width =
+        width * dpr;
+
+    canvas.height =
+        height * dpr;
+
+    const ctx =
+        canvas.getContext("2d");
 
     ctx.setTransform(
-        dpr,
-        0,
-        0,
-        dpr,
-        0,
-        0
+        dpr, 0, 0, dpr, 0, 0
     );
 
     ctx.clearRect(
-        0,
-        0,
+        0, 0,
         width,
         height
     );
 
 
-    /* Background */
+    /*
+       Background
+    */
 
     ctx.fillStyle = "#010611";
 
     ctx.fillRect(
-        0,
-        0,
+        0, 0,
         width,
         height
     );
 
 
-    const left = 45;
-    const right = 12;
-    const top = 10;
-    const bottom = 20;
+    const left = 8;
+    const right = 8;
+    const top = 8;
+    const bottom = 8;
 
     const graphWidth =
         width - left - right;
@@ -264,22 +1271,32 @@ function drawChart(canvas, values, config) {
         height - top - bottom;
 
 
-    /* Grid */
+    /*
+       Grid
+    */
 
     ctx.strokeStyle =
-        "rgba(148,163,184,.10)";
+        "rgba(148,163,184,.08)";
 
     ctx.lineWidth = 1;
 
-    for (let i = 0; i <= 4; i++) {
+    for (
+        let i = 0;
+        i <= 3;
+        i++
+    ) {
 
         const y =
             top +
-            graphHeight * i / 4;
+            graphHeight *
+            i / 3;
 
         ctx.beginPath();
 
-        ctx.moveTo(left, y);
+        ctx.moveTo(
+            left,
+            y
+        );
 
         ctx.lineTo(
             width - right,
@@ -287,102 +1304,83 @@ function drawChart(canvas, values, config) {
         );
 
         ctx.stroke();
-
     }
 
 
-    /* Y axis labels */
+    /*
+       NDT line on anomaly graph
+    */
 
-    ctx.fillStyle = "#64748b";
+    if (
+        canvas.id === "anomalyChart"
+    ) {
 
-    ctx.font = "9px Segoe UI";
+        const normalized =
+            clamp(
+                (
+                    dynamicThreshold -
+                    config.min
+                ) /
+                (
+                    config.max -
+                    config.min
+                ),
+                0,
+                1
+            );
 
-    for (let i = 0; i <= 4; i++) {
-
-        const value =
-            config.max -
-            (
-                config.max -
-                config.min
-            ) * i / 4;
-
-        const y =
+        const thresholdY =
             top +
-            graphHeight * i / 4;
+            graphHeight *
+            (1 - normalized);
 
-        ctx.fillText(
-            value.toFixed(2) + config.unit,
-            4,
-            y + 3
+        ctx.setLineDash(
+            [5,5]
         );
 
+        ctx.strokeStyle =
+            "rgba(250,204,21,.7)";
+
+        ctx.beginPath();
+
+        ctx.moveTo(
+            left,
+            thresholdY
+        );
+
+        ctx.lineTo(
+            width - right,
+            thresholdY
+        );
+
+        ctx.stroke();
+
+        ctx.setLineDash([]);
     }
 
 
-    /* Threshold */
-
-    let thresholdPosition =
-        (
-            config.threshold -
-            config.min
-        ) /
-        (
-            config.max -
-            config.min
-        );
-
-    thresholdPosition =
-        Math.max(
-            0,
-            Math.min(
-                1,
-                thresholdPosition
-            )
-        );
-
-    const thresholdY =
-        top +
-        graphHeight *
-        (
-            1 -
-            thresholdPosition
-        );
-
-    ctx.save();
-
-    ctx.setLineDash([5, 5]);
-
-    ctx.strokeStyle =
-        "rgba(248,113,113,.45)";
-
-    ctx.beginPath();
-
-    ctx.moveTo(
-        left,
-        thresholdY
-    );
-
-    ctx.lineTo(
-        width - right,
-        thresholdY
-    );
-
-    ctx.stroke();
-
-    ctx.restore();
-
-
-    /* Need at least two points */
-
-    if (values.length < 2) return;
-
-
-    /* Data line */
+    /*
+       Line
+    */
 
     ctx.beginPath();
 
     values.forEach(
         (value, index) => {
+
+            const normalized =
+                clamp(
+                    (
+                        value -
+                        config.min
+                    ) /
+                    (
+                        config.max -
+                        config.min
+                    ),
+                    0,
+                    1
+                );
 
             const x =
                 left +
@@ -392,57 +1390,25 @@ function drawChart(canvas, values, config) {
                 ) *
                 graphWidth;
 
-            let normalized =
-                (
-                    value -
-                    config.min
-                ) /
-                (
-                    config.max -
-                    config.min
-                );
-
-            normalized =
-                Math.max(
-                    0,
-                    Math.min(
-                        1,
-                        normalized
-                    )
-                );
-
             const y =
                 top +
                 graphHeight *
-                (
-                    1 -
-                    normalized
-                );
+                (1 - normalized);
 
             if (index === 0) {
-
-                ctx.moveTo(x, y);
-
+                ctx.moveTo(x,y);
             } else {
-
-                ctx.lineTo(x, y);
-
+                ctx.lineTo(x,y);
             }
-
         }
     );
-
 
     ctx.strokeStyle =
         config.color;
 
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = 2;
 
-    ctx.lineJoin = "round";
-
-    ctx.lineCap = "round";
-
-    ctx.shadowBlur = 7;
+    ctx.shadowBlur = 8;
 
     ctx.shadowColor =
         config.color;
@@ -452,84 +1418,276 @@ function drawChart(canvas, values, config) {
     ctx.shadowBlur = 0;
 
 
-    /* Current point */
+    /*
+       Anomaly points
+    */
 
-    const last =
-        values[values.length - 1];
+    values.forEach(
+        (value, index) => {
 
-    let normalized =
-        (
-            last -
-            config.min
-        ) /
-        (
-            config.max -
-            config.min
-        );
+            const score =
+                scores[index] ?? 0;
 
-    normalized =
-        Math.max(
-            0,
-            Math.min(
-                1,
-                normalized
-            )
-        );
+            if (
+                score <= dynamicThreshold
+            ) {
+                return;
+            }
 
-    const lastX =
-        left + graphWidth;
+            const normalized =
+                clamp(
+                    (
+                        value -
+                        config.min
+                    ) /
+                    (
+                        config.max -
+                        config.min
+                    ),
+                    0,
+                    1
+                );
 
-    const lastY =
-        top +
-        graphHeight *
-        (
-            1 -
-            normalized
-        );
+            const x =
+                left +
+                (
+                    index /
+                    (values.length - 1)
+                ) *
+                graphWidth;
 
-    ctx.beginPath();
+            const y =
+                top +
+                graphHeight *
+                (1 - normalized);
 
-    ctx.arc(
-        lastX,
-        lastY,
-        4,
-        0,
-        Math.PI * 2
+
+            ctx.beginPath();
+
+            ctx.arc(
+                x,
+                y,
+                4,
+                0,
+                Math.PI * 2
+            );
+
+            ctx.fillStyle =
+                "#ef4444";
+
+            ctx.shadowBlur = 12;
+
+            ctx.shadowColor =
+                "#ef4444";
+
+            ctx.fill();
+
+            ctx.shadowBlur = 0;
+        }
     );
 
-    ctx.fillStyle =
-        config.color;
 
-    ctx.fill();
+    /*
+       Hover
+    */
+
+    canvas.onmousemove =
+        function(event) {
+
+            const bounds =
+                canvas.getBoundingClientRect();
+
+            const mouseX =
+                event.clientX -
+                bounds.left;
+
+            const ratio =
+                clamp(
+                    (
+                        mouseX -
+                        left
+                    ) /
+                    graphWidth,
+                    0,
+                    1
+                );
+
+            const index =
+                Math.round(
+                    ratio *
+                    (values.length - 1)
+                );
+
+            const value =
+                values[index];
+
+            const score =
+                scores[index] ?? 0;
+
+            const timestamp =
+                timestamps[index];
+
+            const normalized =
+                clamp(
+                    (
+                        value -
+                        config.min
+                    ) /
+                    (
+                        config.max -
+                        config.min
+                    ),
+                    0,
+                    1
+                );
+
+            const pointX =
+                left +
+                (
+                    index /
+                    (values.length - 1)
+                ) *
+                graphWidth;
+
+            const pointY =
+                top +
+                graphHeight *
+                (1 - normalized);
 
 
-    /* Alert ring */
+            let status =
+                score >
+                dynamicThreshold
+                    ? `<div class="tooltip-anomaly">🚨 ANOMALY</div>`
+                    : `<div class="tooltip-normal">🟢 NORMAL</div>`;
 
-    if (
-        config === chartSettings.anomalyScore &&
-        last >= dynamicThreshold
-    ) {
 
-        ctx.beginPath();
+            tooltip.innerHTML = `
 
-        ctx.arc(
-            lastX,
-            lastY,
-            9,
-            0,
-            Math.PI * 2
-        );
+                <div class="tooltip-title">
+                    ${config.icon} ${config.label}
+                </div>
 
-        ctx.strokeStyle =
-            "#f87171";
+                <div>
+                    🕐 ${formatTime(timestamp)}
+                </div>
 
-        ctx.lineWidth = 2;
+                <div>
+                    Value:
+                    <strong>
+                        ${Number(value).toFixed(config.decimals)}
+                        ${config.unit}
+                    </strong>
+                </div>
 
-        ctx.stroke();
+                <div>
+                    AI Score:
+                    <strong>
+                        ${Number(score).toFixed(3)}
+                    </strong>
+                </div>
 
-    }
+                ${status}
 
+            `;
+
+
+            tooltip.classList.add(
+                "visible"
+            );
+
+
+            const tooltipWidth =
+                tooltip.offsetWidth || 160;
+
+            const tooltipHeight =
+                tooltip.offsetHeight || 100;
+
+
+            tooltip.style.left =
+                `${clamp(
+                    pointX - tooltipWidth / 2,
+                    0,
+                    width - tooltipWidth
+                )}px`;
+
+
+            tooltip.style.top =
+                `${clamp(
+                    pointY - tooltipHeight - 10,
+                    0,
+                    height - tooltipHeight
+                )}px`;
+
+        };
+
+
+    canvas.onmouseleave =
+        function() {
+
+            tooltip.classList.remove(
+                "visible"
+            );
+        };
 }
+
+
+/* =========================================================
+   CHART CONFIG
+========================================================= */
+
+const chartConfigs = {
+
+    temperature: {
+        min: 20,
+        max: 50,
+        color: "#38bdf8",
+        label: "TEMPERATURE",
+        icon: "🌡️",
+        unit: "°C",
+        decimals: 2
+    },
+
+    voltage: {
+        min: 3,
+        max: 4.2,
+        color: "#a78bfa",
+        label: "BATTERY VOLTAGE",
+        icon: "🔋",
+        unit: "V",
+        decimals: 3
+    },
+
+    current: {
+        min: 0,
+        max: 2.5,
+        color: "#fb923c",
+        label: "CURRENT",
+        icon: "⚡",
+        unit: "A",
+        decimals: 3
+    },
+
+    solar: {
+        min: 0,
+        max: 6,
+        color: "#facc15",
+        label: "SOLAR POWER",
+        icon: "☀️",
+        unit: "W",
+        decimals: 3
+    },
+
+    anomalyScore: {
+        min: 0,
+        max: 1,
+        color: "#f87171",
+        label: "ANOMALY SCORE",
+        icon: "🚨",
+        unit: "",
+        decimals: 3
+    }
+};
 
 
 /* =========================================================
@@ -538,253 +1696,683 @@ function drawChart(canvas, values, config) {
 
 function drawAllCharts() {
 
-    drawChart(
+    drawInteractiveChart(
         canvases.temperature,
         history.temperature,
-        chartSettings.temperature
+        history.timestamps,
+        history.anomalyScore,
+        chartConfigs.temperature,
+        document.getElementById(
+            "temperatureTooltip"
+        )
     );
 
-    drawChart(
+
+    drawInteractiveChart(
         canvases.voltage,
         history.voltage,
-        chartSettings.voltage
+        history.timestamps,
+        history.anomalyScore,
+        chartConfigs.voltage,
+        document.getElementById(
+            "voltageTooltip"
+        )
     );
 
-    drawChart(
+
+    drawInteractiveChart(
         canvases.current,
         history.current,
-        chartSettings.current
+        history.timestamps,
+        history.anomalyScore,
+        chartConfigs.current,
+        document.getElementById(
+            "currentTooltip"
+        )
     );
 
-    drawChart(
+
+    drawInteractiveChart(
         canvases.solar,
         history.solar,
-        chartSettings.solar
+        history.timestamps,
+        history.anomalyScore,
+        chartConfigs.solar,
+        document.getElementById(
+            "solarTooltip"
+        )
     );
 
-    drawChart(
+
+    drawInteractiveChart(
         canvases.anomalyScore,
         history.anomalyScore,
-        chartSettings.anomalyScore
+        history.timestamps,
+        history.anomalyScore,
+        chartConfigs.anomalyScore,
+        document.getElementById(
+            "anomalyTooltip"
+        )
     );
-
 }
 
 
 /* =========================================================
-   UPDATE TELEMETRY
+   ANOMALY TABLE
 ========================================================= */
 
-function updateTelemetry() {
+function addAnomalyRow(event) {
+
+    const tbody =
+        document.getElementById(
+            "anomalyTableBody"
+        );
+
+    if (!tbody) {
+        return;
+    }
 
 
-    /* =====================================================
-       PHASE 1 — NORMAL
-    ===================================================== */
+    if (
+        tbody.children.length === 1 &&
+        tbody.textContent.includes(
+            "Waiting"
+        )
+    ) {
+        tbody.innerHTML = "";
+    }
+
+
+    const row =
+        document.createElement("tr");
+
+
+    const contributors =
+        event.contributors.length
+            ? event.contributors.map(
+                item => item.label
+            ).join(" • ")
+            : "Multivariate deviation";
+
+
+    row.innerHTML = `
+
+        <td>
+            ${formatTime(event.timestamp)}
+        </td>
+
+        <td>
+            ${event.subsystem.icon}
+            ${event.subsystem.name}
+        </td>
+
+        <td>
+            🔴 ${event.severity}
+        </td>
+
+        <td>
+            ${event.score.toFixed(3)}
+        </td>
+
+        <td>
+            ${contributors}
+        </td>
+
+    `;
+
+
+    tbody.prepend(row);
+}
+
+
+/* =========================================================
+   REAL ANOMALIES
+========================================================= */
+
+function processRealAnomalies() {
+
+    const rows =
+        mlData.anomalies;
+
+
+    if (!rows.length) {
+
+        if (
+            telemetry.anomalyScore >
+            dynamicThreshold
+        ) {
+
+            const event =
+                createDynamicEvent(
+                    telemetry.anomalyScore,
+                    history.timestamps[
+                        history.timestamps.length - 1
+                    ],
+                    telemetry
+                );
+
+            showDynamicAnomaly(event);
+
+        } else {
+
+            showNormalStatus();
+        }
+
+        return;
+    }
+
+
+    const tbody =
+        document.getElementById(
+            "anomalyTableBody"
+        );
+
+    tbody.innerHTML = "";
+
+
+    rows.forEach(
+        anomaly => {
+
+            const score =
+                getNumber(
+                    anomaly,
+                    [
+                        "anomaly_score",
+                        "score",
+                        "reconstruction_error"
+                    ],
+                    0
+                );
+
+
+            const timestamp =
+                getValue(
+                    anomaly,
+                    [
+                        "timestamp",
+                        "time",
+                        "datetime"
+                    ],
+                    new Date().toISOString()
+                );
+
+
+            const values = {
+
+                temperature:
+                    getNumber(
+                        anomaly,
+                        [
+                            "temperature",
+                            "temp"
+                        ],
+                        telemetry.temperature
+                    ),
+
+                voltage:
+                    getNumber(
+                        anomaly,
+                        [
+                            "voltage",
+                            "battery_voltage"
+                        ],
+                        telemetry.voltage
+                    ),
+
+                current:
+                    getNumber(
+                        anomaly,
+                        [
+                            "current",
+                            "battery_current"
+                        ],
+                        telemetry.current
+                    ),
+
+                solar:
+                    getNumber(
+                        anomaly,
+                        [
+                            "solar",
+                            "solar_power"
+                        ],
+                        telemetry.solar
+                    )
+            };
+
+
+            const event =
+                createDynamicEvent(
+                    score,
+                    timestamp,
+                    values
+                );
+
+
+            addAnomalyRow(event);
+
+        }
+    );
+
+
+    const latest =
+        rows[rows.length - 1];
+
+
+    const latestScore =
+        getNumber(
+            latest,
+            [
+                "anomaly_score",
+                "score",
+                "reconstruction_error"
+            ],
+            telemetry.anomalyScore
+        );
+
+
+    const latestTime =
+        getValue(
+            latest,
+            [
+                "timestamp",
+                "time",
+                "datetime"
+            ],
+            new Date().toISOString()
+        );
+
+
+    const latestValues = {
+
+        temperature:
+            getNumber(
+                latest,
+                ["temperature","temp"],
+                telemetry.temperature
+            ),
+
+        voltage:
+            getNumber(
+                latest,
+                ["voltage","battery_voltage"],
+                telemetry.voltage
+            ),
+
+        current:
+            getNumber(
+                latest,
+                ["current","battery_current"],
+                telemetry.current
+            ),
+
+        solar:
+            getNumber(
+                latest,
+                ["solar","solar_power"],
+                telemetry.solar
+            )
+    };
+
+
+    const event =
+        createDynamicEvent(
+            latestScore,
+            latestTime,
+            latestValues
+        );
+
+
+    showDynamicAnomaly(event);
+}
+
+
+/* =========================================================
+   DEMO MODE
+========================================================= */
+
+function initializeDemoHistory() {
+
+    if (history.temperature.length) {
+        return;
+    }
+
+
+    for (
+        let i = 0;
+        i < MAX_POINTS;
+        i++
+    ) {
+
+        history.temperature.push(
+            NORMAL.temperature +
+            (
+                Math.random() - .5
+            ) * 1.2
+        );
+
+        history.voltage.push(
+            NORMAL.voltage +
+            (
+                Math.random() - .5
+            ) * .06
+        );
+
+        history.current.push(
+            NORMAL.current +
+            (
+                Math.random() - .5
+            ) * .15
+        );
+
+        history.solar.push(
+            NORMAL.solar +
+            (
+                Math.random() - .5
+            ) * .4
+        );
+
+        history.anomalyScore.push(
+            .07 +
+            Math.random() * .06
+        );
+
+        history.timestamps.push(
+            new Date(
+                Date.now() -
+                (
+                    MAX_POINTS - i
+                ) * 1000
+            ).toISOString()
+        );
+
+        history.anomalyFlags.push(false);
+    }
+}
+
+
+function startDemoMode() {
+
+    initializeDemoHistory();
+
+    dynamicThreshold = .43;
+
+    drawAllCharts();
+
+    updateUI();
+
+    startNormalPhase();
+}
+
+
+/* =========================================================
+   DEMO PHASES
+========================================================= */
+
+function startNormalPhase() {
+
+    systemPhase = "normal";
+
+    showNormalStatus();
+
+    clearTimeout(phaseTimer);
+
+    phaseTimer =
+        setTimeout(
+            startWarningPhase,
+            15000
+        );
+}
+
+
+function startWarningPhase() {
+
+    systemPhase = "warning";
+
+    setText(
+        "heroStatus",
+        "EARLY WARNING"
+    );
+
+    setText(
+        "heroMessage",
+        "AI detected a growing deviation from nominal telemetry."
+    );
+
+    setText(
+        "systemStatus",
+        "● WARNING"
+    );
+
+    setText(
+        "spacecraftState",
+        "● WARNING"
+    );
+
+    setText(
+        "riskLevel",
+        "WARNING"
+    );
+
+    document.body.classList.add(
+        "warning-mode"
+    );
+
+    document.body.classList.remove(
+        "anomaly-mode"
+    );
+
+    clearTimeout(phaseTimer);
+
+    phaseTimer =
+        setTimeout(
+            startAnomalyPhase,
+            8000
+        );
+}
+
+
+function startAnomalyPhase() {
+
+    systemPhase = "anomaly";
+
+    /*
+       Create a realistic POWER anomaly.
+       The recommendation is generated from
+       the actual changing channels.
+    */
+
+    const event =
+        createDynamicEvent(
+            telemetry.anomalyScore,
+            new Date().toISOString(),
+            telemetry
+        );
+
+
+    showDynamicAnomaly(event);
+
+    addAnomalyRow(event);
+
+    clearTimeout(phaseTimer);
+
+    phaseTimer =
+        setTimeout(
+            startRecoveryPhase,
+            10000
+        );
+}
+
+
+function startRecoveryPhase() {
+
+    systemPhase = "recovery";
+
+    setText(
+        "heroStatus",
+        "SYSTEM RECOVERY"
+    );
+
+    setText(
+        "heroMessage",
+        "Telemetry is returning toward nominal conditions."
+    );
+
+    setText(
+        "systemStatus",
+        "● RECOVERING"
+    );
+
+    setText(
+        "spacecraftState",
+        "● RECOVERING"
+    );
+
+    setText(
+        "riskLevel",
+        "WATCH"
+    );
+
+    document.body.classList.add(
+        "warning-mode"
+    );
+
+    document.body.classList.remove(
+        "anomaly-mode"
+    );
+
+    clearTimeout(phaseTimer);
+
+    phaseTimer =
+        setTimeout(
+            startNormalPhase,
+            10000
+        );
+}
+
+
+/* =========================================================
+   DEMO TELEMETRY
+========================================================= */
+
+function updateDemoTelemetry() {
+
+    if (usingRealML) {
+        return;
+    }
+
 
     if (systemPhase === "normal") {
 
         telemetry.temperature +=
-            (Math.random() - 0.5) * 0.20;
+            (
+                Math.random() - .5
+            ) * .15;
 
         telemetry.voltage +=
-            (Math.random() - 0.5) * 0.006;
+            (
+                Math.random() - .5
+            ) * .008;
 
         telemetry.current +=
-            (Math.random() - 0.5) * 0.018;
+            (
+                Math.random() - .5
+            ) * .02;
 
         telemetry.solar +=
-            (Math.random() - 0.5) * 0.06;
+            (
+                Math.random() - .5
+            ) * .06;
 
         telemetry.anomalyScore +=
-            (Math.random() - 0.5) * 0.015;
-
+            (
+                Math.random() - .5
+            ) * .01;
 
         telemetry.anomalyScore =
-            Math.max(
-                0.05,
-                Math.min(
-                    0.20,
-                    telemetry.anomalyScore
-                )
+            clamp(
+                telemetry.anomalyScore,
+                .04,
+                .18
             );
-
     }
 
-
-    /* =====================================================
-       PHASE 2 — WARNING
-    ===================================================== */
 
     else if (systemPhase === "warning") {
 
-        /*
-           Something is beginning to change.
+        telemetry.temperature += .09;
 
-           TEMP      ↑
-           VOLTAGE   ↓
-           CURRENT   ↑
-           SOLAR     ↓
-           SCORE     ↑
-        */
+        telemetry.voltage -= .008;
 
-        telemetry.temperature +=
-            0.10;
+        telemetry.current += .018;
 
-        telemetry.voltage -=
-            0.008;
+        telemetry.solar -= .05;
 
-        telemetry.current +=
-            0.018;
-
-        telemetry.solar -=
-            0.06;
-
-        telemetry.anomalyScore +=
-            0.035;
-
+        telemetry.anomalyScore += .025;
 
         telemetry.anomalyScore =
-            Math.min(
-                0.55,
-                telemetry.anomalyScore
+            clamp(
+                telemetry.anomalyScore,
+                .10,
+                .55
             );
-
     }
 
-
-    /* =====================================================
-       PHASE 3 — ANOMALY
-    ===================================================== */
 
     else if (systemPhase === "anomaly") {
 
-        /*
-           Strong abnormal pattern.
-        */
+        telemetry.temperature += .05;
 
-        telemetry.temperature +=
-            0.06;
+        telemetry.voltage -= .006;
 
-        telemetry.voltage -=
-            0.007;
+        telemetry.current += .014;
 
-        telemetry.current +=
-            0.015;
+        telemetry.solar -= .04;
 
-        telemetry.solar -=
-            0.04;
-
-        telemetry.anomalyScore +=
-            0.025;
-
+        telemetry.anomalyScore += .022;
 
         telemetry.anomalyScore =
-            Math.min(
-                0.90,
-                telemetry.anomalyScore
+            clamp(
+                telemetry.anomalyScore,
+                .30,
+                .95
             );
-
     }
 
 
-    /* =====================================================
-       PHASE 4 — RECOVERY
-    ===================================================== */
-
     else if (systemPhase === "recovery") {
-
-        /*
-           Slowly move back toward
-           normal spacecraft behavior.
-        */
 
         telemetry.temperature +=
             (
                 NORMAL.temperature -
                 telemetry.temperature
-            ) * 0.15;
+            ) * .15;
 
         telemetry.voltage +=
             (
                 NORMAL.voltage -
                 telemetry.voltage
-            ) * 0.15;
+            ) * .15;
 
         telemetry.current +=
             (
                 NORMAL.current -
                 telemetry.current
-            ) * 0.15;
+            ) * .15;
 
         telemetry.solar +=
             (
                 NORMAL.solar -
                 telemetry.solar
-            ) * 0.15;
+            ) * .15;
 
         telemetry.anomalyScore +=
             (
-                NORMAL.anomalyScore -
+                .10 -
                 telemetry.anomalyScore
-            ) * 0.20;
-
+            ) * .20;
     }
 
-
-    /* =====================================================
-       SAFETY LIMITS
-    ===================================================== */
-
-    telemetry.temperature =
-        Math.max(
-            25,
-            Math.min(
-                45,
-                telemetry.temperature
-            )
-        );
-
-    telemetry.voltage =
-        Math.max(
-            3.2,
-            Math.min(
-                4,
-                telemetry.voltage
-            )
-        );
-
-    telemetry.current =
-        Math.max(
-            0.7,
-            Math.min(
-                2,
-                telemetry.current
-            )
-        );
-
-    telemetry.solar =
-        Math.max(
-            1.5,
-            Math.min(
-                5.5,
-                telemetry.solar
-            )
-        );
-
-    telemetry.anomalyScore =
-        Math.max(
-            0,
-            Math.min(
-                1,
-                telemetry.anomalyScore
-            )
-        );
-
-
-    /* =====================================================
-       STORE DATA
-    ===================================================== */
 
     history.temperature.push(
         telemetry.temperature
@@ -806,790 +2394,21 @@ function updateTelemetry() {
         telemetry.anomalyScore
     );
 
-
-    /* Keep last 60 */
-
-    Object.keys(history).forEach(
-        key => {
-
-            if (
-                history[key].length >
-                MAX_POINTS
-            ) {
-
-                history[key].shift();
-
-            }
-
-        }
+    history.timestamps.push(
+        new Date().toISOString()
     );
 
+    history.anomalyFlags.push(
+        telemetry.anomalyScore >
+        dynamicThreshold
+    );
+
+
+    trimHistory();
 
     updateUI();
 
     drawAllCharts();
-
-    addTerminalLine();
-
-}
-
-
-/* =========================================================
-   UPDATE UI
-========================================================= */
-
-function updateUI() {
-
-    setText(
-        "temperatureValue",
-        telemetry.temperature.toFixed(1) + " °C"
-    );
-
-    setText(
-        "voltageValue",
-        telemetry.voltage.toFixed(2) + " V"
-    );
-
-    setText(
-        "currentValue",
-        telemetry.current.toFixed(2) + " A"
-    );
-
-    setText(
-        "solarValue",
-        telemetry.solar.toFixed(2) + " W"
-    );
-
-    setText(
-        "tempCard",
-        telemetry.temperature.toFixed(1) + " °C"
-    );
-
-    setText(
-        "voltCard",
-        telemetry.voltage.toFixed(2) + " V"
-    );
-
-    setText(
-        "currentCard",
-        telemetry.current.toFixed(2) + " A"
-    );
-
-    setText(
-        "solarCard",
-        telemetry.solar.toFixed(2) + " W"
-    );
-
-    setText(
-        "anomalyValue",
-        telemetry.anomalyScore.toFixed(2)
-    );
-
-    setText(
-        "aiScore",
-        telemetry.anomalyScore.toFixed(2)
-    );
-
-    setText(
-        "ndtThreshold",
-        dynamicThreshold.toFixed(2)
-    );
-
-}
-
-
-/* =========================================================
-   SAFE TEXT UPDATE
-========================================================= */
-
-function setText(id, value) {
-
-    const element =
-        document.getElementById(id);
-
-    if (element) {
-
-        element.textContent =
-            value;
-
-    }
-
-}
-
-
-/* =========================================================
-   NORMAL STATUS
-========================================================= */
-
-function showNormalStatus() {
-
-    setText(
-        "heroStatus",
-        "SYSTEM NOMINAL"
-    );
-
-    setText(
-        "heroMessage",
-        "All spacecraft subsystems operating normally."
-    );
-
-    setText(
-        "systemStatus",
-        "● ONLINE"
-    );
-
-    setText(
-        "statusCircle",
-        "✓"
-    );
-
-    setText(
-        "twinHealth",
-        "NOMINAL"
-    );
-
-    setText(
-        "riskLevel",
-        "LOW"
-    );
-
-    setText(
-        "riskDescription",
-        "Stable operation"
-    );
-
-    setText(
-        "healthValue",
-        "94"
-    );
-
-
-    const progress =
-        document.getElementById(
-            "healthProgress"
-        );
-
-    if (progress) {
-
-        progress.style.width =
-            "94%";
-
-        progress.style.background =
-            "linear-gradient(90deg,#22c55e,#4ade80,#22d3ee)";
-
-    }
-
-
-    setText(
-        "powerStatus",
-        "● NOMINAL"
-    );
-
-    setText(
-        "batteryStatus",
-        "● NOMINAL"
-    );
-
-    setText(
-        "thermalStatus",
-        "● NOMINAL"
-    );
-
-    setText(
-        "communicationStatus",
-        "● NOMINAL"
-    );
-
-
-    document.body.classList.remove(
-        "anomaly-mode"
-    );
-
-    document.body.classList.remove(
-        "warning-mode"
-    );
-
-}
-
-
-/* =========================================================
-   WARNING STATUS
-========================================================= */
-
-function showWarningStatus() {
-
-    setText(
-        "heroStatus",
-        "EARLY WARNING"
-    );
-
-    setText(
-        "heroMessage",
-        "AI detected an unusual multivariate pattern."
-    );
-
-    setText(
-        "systemStatus",
-        "● WARNING"
-    );
-
-    setText(
-        "statusCircle",
-        "!"
-    );
-
-    setText(
-        "twinHealth",
-        "WARNING"
-    );
-
-    setText(
-        "riskLevel",
-        "MEDIUM"
-    );
-
-    setText(
-        "riskDescription",
-        "Pattern deviation detected"
-    );
-
-    setText(
-        "healthValue",
-        "81"
-    );
-
-
-    const progress =
-        document.getElementById(
-            "healthProgress"
-        );
-
-    if (progress) {
-
-        progress.style.width =
-            "81%";
-
-        progress.style.background =
-            "linear-gradient(90deg,#facc15,#fb923c)";
-
-    }
-
-
-    document.body.classList.add(
-        "warning-mode"
-    );
-
-    document.body.classList.remove(
-        "anomaly-mode"
-    );
-
-}
-
-
-/* =========================================================
-   ANOMALY STATUS
-========================================================= */
-
-function showAnomalyStatus() {
-
-    setText(
-        "heroStatus",
-        "ANOMALY DETECTED"
-    );
-
-    setText(
-        "heroMessage",
-        "High-risk multivariate telemetry anomaly detected."
-    );
-
-    setText(
-        "systemStatus",
-        "● ALERT"
-    );
-
-    setText(
-        "statusCircle",
-        "!"
-    );
-
-    setText(
-        "twinHealth",
-        "ANOMALY"
-    );
-
-    setText(
-        "riskLevel",
-        "HIGH"
-    );
-
-    setText(
-        "riskDescription",
-        "Power subsystem"
-    );
-
-    setText(
-        "healthValue",
-        "64"
-    );
-
-
-    const progress =
-        document.getElementById(
-            "healthProgress"
-        );
-
-    if (progress) {
-
-        progress.style.width =
-            "64%";
-
-        progress.style.background =
-            "linear-gradient(90deg,#f87171,#fb923c)";
-
-    }
-
-
-    setText(
-        "powerStatus",
-        "● HIGH RISK"
-    );
-
-    setText(
-        "batteryStatus",
-        "● WARNING"
-    );
-
-
-    document.body.classList.add(
-        "anomaly-mode"
-    );
-
-    document.body.classList.remove(
-        "warning-mode"
-    );
-
-}
-
-
-/* =========================================================
-   RECOVERY STATUS
-========================================================= */
-
-function showRecoveryStatus() {
-
-    setText(
-        "heroStatus",
-        "SYSTEM RECOVERY"
-    );
-
-    setText(
-        "heroMessage",
-        "Spacecraft telemetry is returning to nominal conditions."
-    );
-
-    setText(
-        "systemStatus",
-        "● RECOVERING"
-    );
-
-    setText(
-        "statusCircle",
-        "↻"
-    );
-
-    setText(
-        "twinHealth",
-        "RECOVERING"
-    );
-
-    setText(
-        "riskLevel",
-        "MEDIUM"
-    );
-
-    setText(
-        "riskDescription",
-        "Stabilizing"
-    );
-
-
-    document.body.classList.remove(
-        "anomaly-mode"
-    );
-
-    document.body.classList.add(
-        "warning-mode"
-    );
-
-}
-
-
-/* =========================================================
-   RECORD ONE ANOMALY
-========================================================= */
-
-function recordAnomaly() {
-
-    /*
-       CRITICAL:
-
-       If this anomaly has already been
-       recorded, DO NOT create another one.
-    */
-
-    if (anomalyRecorded) {
-
-        return;
-
-    }
-
-
-    anomalyRecorded = true;
-
-    anomalyDetected = true;
-
-
-    const now =
-        new Date();
-
-
-    const event = {
-
-        time:
-            now.toLocaleTimeString(),
-
-        timestamp:
-            now.toLocaleString(),
-
-        subsystem:
-            "Power Subsystem",
-
-        severity:
-            "HIGH",
-
-        score:
-            telemetry.anomalyScore.toFixed(2),
-
-        contributors: [
-
-            "Battery Voltage ↓",
-
-            "Solar Power ↓",
-
-            "Current ↑",
-
-            "Temperature ↑"
-
-        ]
-
-    };
-
-
-    anomalyHistory.push(
-        event
-    );
-
-
-    console.log(
-        "🚨 NEW ANOMALY EVENT",
-        event
-    );
-
-
-    addAnomalyRow(
-        event
-    );
-
-
-    showLatestAnomaly(
-        event
-    );
-
-}
-
-
-/* =========================================================
-   ANOMALY TABLE
-========================================================= */
-
-function addAnomalyRow(event) {
-
-    const tbody =
-        document.getElementById(
-            "anomalyTableBody"
-        );
-
-
-    if (!tbody) return;
-
-
-    const row =
-        document.createElement(
-            "tr"
-        );
-
-
-    row.innerHTML = `
-
-        <td>
-            ${event.time}
-        </td>
-
-        <td>
-            <span class="location-badge">
-                📍 ${event.subsystem}
-            </span>
-        </td>
-
-        <td>
-            <span class="severity-high">
-                🔴 ${event.severity}
-            </span>
-        </td>
-
-        <td>
-            ${event.score}
-        </td>
-
-        <td>
-
-            ${event.contributors
-                .map(
-                    item =>
-                    `<span class="parameter">
-                        ${item}
-                    </span>`
-                )
-                .join(" ")
-            }
-
-        </td>
-
-    `;
-
-
-    tbody.prepend(
-        row
-    );
-
-
-    const empty =
-        document.getElementById(
-            "noAnomaly"
-        );
-
-    if (empty) {
-
-        empty.classList.add(
-            "hidden"
-        );
-
-    }
-
-
-    const table =
-        document.getElementById(
-            "anomalyTableContainer"
-        );
-
-    if (table) {
-
-        table.classList.remove(
-            "hidden"
-        );
-
-    }
-
-
-    setText(
-        "anomalyCounter",
-        anomalyHistory.length +
-        (
-            anomalyHistory.length === 1
-                ? " DETECTION"
-                : " DETECTIONS"
-        )
-    );
-
-}
-
-
-/* =========================================================
-   LATEST ANOMALY
-========================================================= */
-
-function showLatestAnomaly(event) {
-
-    const panel =
-        document.getElementById(
-            "latestAnomaly"
-        );
-
-
-    if (panel) {
-
-        panel.classList.remove(
-            "hidden"
-        );
-
-    }
-
-
-    setText(
-        "latestLocation",
-        event.subsystem
-    );
-
-    setText(
-        "latestTime",
-        event.timestamp
-    );
-
-    setText(
-        "latestSeverity",
-        event.severity
-    );
-
-    setText(
-        "latestScore",
-        event.score
-    );
-
-    setText(
-        "latestExplanation",
-        "AI identified a correlated power-system pattern: " +
-        "battery voltage decreased while solar power and " +
-        "current changed simultaneously."
-    );
-
-}
-
-
-/* =========================================================
-   PHASE MANAGEMENT
-========================================================= */
-
-function startNormalPhase() {
-
-    systemPhase =
-        "normal";
-
-    anomalyDetected =
-        false;
-
-    anomalyRecorded =
-        false;
-
-    showNormalStatus();
-
-
-    console.log(
-        "🟢 NORMAL PHASE"
-    );
-
-
-    clearTimeout(
-        phaseTimer
-    );
-
-
-    phaseTimer =
-        setTimeout(
-            startWarningPhase,
-            NORMAL_TIME
-        );
-
-}
-
-
-function startWarningPhase() {
-
-    systemPhase =
-        "warning";
-
-
-    showWarningStatus();
-
-
-    console.log(
-        "🟡 WARNING PHASE"
-    );
-
-
-    clearTimeout(
-        phaseTimer
-    );
-
-
-    phaseTimer =
-        setTimeout(
-            startAnomalyPhase,
-            WARNING_TIME
-        );
-
-}
-
-
-function startAnomalyPhase() {
-
-    systemPhase =
-        "anomaly";
-
-
-    showAnomalyStatus();
-
-
-    /*
-       Record exactly ONE anomaly.
-    */
-
-    recordAnomaly();
-
-
-    console.log(
-        "🔴 ANOMALY PHASE"
-    );
-
-
-    clearTimeout(
-        phaseTimer
-    );
-
-
-    phaseTimer =
-        setTimeout(
-            startRecoveryPhase,
-            ANOMALY_TIME
-        );
-
-}
-
-
-function startRecoveryPhase() {
-
-    systemPhase =
-        "recovery";
-
-
-    showRecoveryStatus();
-
-
-    console.log(
-        "🟡 RECOVERY PHASE"
-    );
-
-
-    clearTimeout(
-        phaseTimer
-    );
-
-
-    phaseTimer =
-        setTimeout(
-            startNormalPhase,
-            RECOVERY_TIME
-        );
-
 }
 
 
@@ -1604,328 +2423,266 @@ function addTerminalLine() {
             "terminalLog"
         );
 
-
-    if (!terminal) return;
-
-
-    const time =
-        new Date()
-            .toLocaleTimeString();
+    if (!terminal) {
+        return;
+    }
 
 
-    const icon =
-
-        systemPhase === "normal"
-            ? "🟢"
-
-        : systemPhase === "warning"
-            ? "🟡"
-
-        : systemPhase === "anomaly"
-            ? "🔴"
-
-        : "🔵";
+    const isAnomaly =
+        telemetry.anomalyScore >
+        dynamicThreshold ||
+        systemPhase === "anomaly";
 
 
     const line =
-        document.createElement(
-            "div"
+        document.createElement("div");
+
+
+    line.className =
+        "telemetry-line";
+
+
+    if (isAnomaly) {
+
+        line.classList.add(
+            "anomaly-line"
         );
+    }
 
 
     line.textContent =
 
-        `[${time}] ${icon} ` +
+        `[${new Date().toLocaleTimeString()}] ` +
 
-        `TEMP=${telemetry.temperature.toFixed(1)}°C ` +
+        `TEMP=${telemetry.temperature.toFixed(2)}°C ` +
 
-        `V=${telemetry.voltage.toFixed(2)}V ` +
+        `V=${telemetry.voltage.toFixed(3)}V ` +
 
-        `I=${telemetry.current.toFixed(2)}A ` +
+        `I=${telemetry.current.toFixed(3)}A ` +
 
-        `SOLAR=${telemetry.solar.toFixed(2)}W ` +
+        `SOLAR=${telemetry.solar.toFixed(3)}W ` +
 
-        `AI_SCORE=${telemetry.anomalyScore.toFixed(2)}`;
-
-
-    if (
-        systemPhase === "anomaly"
-    ) {
-
-        line.style.color =
-            "#f87171";
-
-    }
-
-    else if (
-        systemPhase === "warning"
-    ) {
-
-        line.style.color =
-            "#facc15";
-
-    }
-
-    else {
-
-        line.style.color =
-            "#4ade80";
-
-    }
+        `AI_SCORE=${telemetry.anomalyScore.toFixed(3)}`;
 
 
-    terminal.appendChild(
-        line
+    terminal.appendChild(line);
+
+
+    line.addEventListener(
+        "click",
+        () => {
+
+            const event =
+                createDynamicEvent(
+                    telemetry.anomalyScore,
+                    new Date().toISOString(),
+                    telemetry
+                );
+
+            showDynamicAnomaly(event);
+        }
     );
 
 
     while (
-        terminal.children.length > 25
+        terminal.children.length > 35
     ) {
 
         terminal.removeChild(
             terminal.firstChild
         );
-
     }
 
 
     terminal.scrollTop =
         terminal.scrollHeight;
-
 }
 
 
 /* =========================================================
-   SUBSYSTEM DETAILS
+   REAL TERMINAL
 ========================================================= */
 
-const subsystemInfo = {
+function populateTerminalFromRealData() {
 
-    thermal: {
+    const terminal =
+        document.getElementById(
+            "terminalLog"
+        );
 
-        icon: "🌡️",
-
-        title: "Thermal",
-
-        health: "97%"
-
-    },
-
-    power: {
-
-        icon: "⚡",
-
-        title: "Power",
-
-        health: "96%"
-
-    },
-
-    battery: {
-
-        icon: "🔋",
-
-        title: "Battery",
-
-        health: "94%"
-
-    },
-
-    communication: {
-
-        icon: "📡",
-
-        title: "Communication",
-
-        health: "99%"
-
+    if (!terminal) {
+        return;
     }
 
-};
+    terminal.innerHTML = "";
 
 
-function showSubsystem(name) {
-
-    const data =
-        subsystemInfo[name];
+    const rows =
+        getTelemetryRows().slice(-25);
 
 
-    if (!data) return;
+    rows.forEach(row => {
+
+        const temperature =
+            getNumber(
+                row,
+                [
+                    "temperature",
+                    "Temperature",
+                    "temp",
+                    "TEMP"
+                ],
+                0
+            );
+
+        const voltage =
+            getNumber(
+                row,
+                [
+                    "voltage",
+                    "Voltage",
+                    "V"
+                ],
+                0
+            );
+
+        const current =
+            getNumber(
+                row,
+                [
+                    "current",
+                    "Current",
+                    "I"
+                ],
+                0
+            );
+
+        const solar =
+            getNumber(
+                row,
+                [
+                    "solar",
+                    "Solar",
+                    "solar_power",
+                    "SOLAR"
+                ],
+                0
+            );
+
+        const score =
+            getNumber(
+                row,
+                [
+                    "anomaly_score",
+                    "score",
+                    "reconstruction_error"
+                ],
+                0
+            );
+
+        const timestamp =
+            getValue(
+                row,
+                [
+                    "timestamp",
+                    "time",
+                    "datetime"
+                ],
+                "--"
+            );
 
 
-    const panel =
-        document.getElementById(
-            "subsystemDetails"
+        const line =
+            document.createElement("div");
+
+
+        line.className =
+            "telemetry-line";
+
+
+        if (
+            score >
+            dynamicThreshold
+        ) {
+
+            line.classList.add(
+                "anomaly-line"
+            );
+        }
+
+
+        line.textContent =
+
+            `[${formatTime(timestamp)}] ` +
+
+            `TEMP=${Number(
+                temperature
+            ).toFixed(2)}°C ` +
+
+            `V=${Number(
+                voltage
+            ).toFixed(3)}V ` +
+
+            `I=${Number(
+                current
+            ).toFixed(3)}A ` +
+
+            `SOLAR=${Number(
+                solar
+            ).toFixed(3)}W ` +
+
+            `AI_SCORE=${Number(
+                score
+            ).toFixed(3)}`;
+
+
+        line.addEventListener(
+            "click",
+            () => {
+
+                const event =
+                    createDynamicEvent(
+                        score,
+                        timestamp,
+                        {
+                            temperature,
+                            voltage,
+                            current,
+                            solar
+                        }
+                    );
+
+                showDynamicAnomaly(event);
+            }
         );
 
 
-    if (panel) {
-
-        panel.classList.remove(
-            "hidden"
-        );
-
-    }
+        terminal.appendChild(line);
+    });
 
 
-    setText(
-        "detailsIcon",
-        data.icon
-    );
-
-    setText(
-        "detailsTitle",
-        data.title
-    );
-
-    setText(
-        "detailsHealth",
-        data.health
-    );
-
-
-    const affected =
-
-        systemPhase === "anomaly" &&
-
-        (
-            name === "power" ||
-            name === "battery"
-        );
-
-
-    setText(
-        "detailsStatus",
-
-        affected
-            ? "ATTENTION REQUIRED"
-            : "NOMINAL"
-    );
-
-
-    setText(
-        "detailsRisk",
-
-        affected
-            ? "HIGH"
-            : "LOW"
-    );
-
-}
-
-
-function closeSubsystem() {
-
-    const panel =
-        document.getElementById(
-            "subsystemDetails"
-        );
-
-
-    if (panel) {
-
-        panel.classList.add(
-            "hidden"
-        );
-
-    }
-
-}
-
-
-/* =========================================================
-   MISSION MODE
-========================================================= */
-
-function changeMode() {
-
-    const selector =
-        document.getElementById(
-            "modeSelector"
-        );
-
-
-    if (!selector) return;
-
-
-    const mode =
-        selector.value;
-
-
-    const modes = {
-
-        sunlight:
-            "☀️ SUNLIGHT",
-
-        eclipse:
-            "🌑 ECLIPSE",
-
-        communication:
-            "📡 COMMUNICATION",
-
-        safe:
-            "🛡️ SAFE MODE"
-
-    };
-
-
-    const descriptions = {
-
-        sunlight:
-            "Normal sunlight operation",
-
-        eclipse:
-            "Reduced solar generation expected",
-
-        communication:
-            "Communication subsystem priority",
-
-        safe:
-            "Conservative spacecraft operation"
-
-    };
-
-
-    setText(
-        "missionMode",
-        modes[mode]
-    );
-
-
-    setText(
-        "contextText",
-        descriptions[mode]
-    );
-
-
-    setText(
-        "contextRisk",
-
-        systemPhase === "anomaly"
-            ? "ELEVATED"
-            : "LOW"
-    );
-
+    terminal.scrollTop =
+        terminal.scrollHeight;
 }
 
 
 /* =========================================================
-   MAIN LOOP
+   TIMER
 ========================================================= */
 
 setInterval(
-    updateTelemetry,
+    updateDemoTelemetry,
     1000
 );
 
-
-/* =========================================================
-   TERMINAL LOOP
-========================================================= */
-
 setInterval(
-    addTerminalLine,
+    () => {
+
+        if (!usingRealML) {
+            addTerminalLine();
+        }
+
+    },
     1000
 );
 
@@ -1941,35 +2698,18 @@ window.addEventListener(
 
 
 /* =========================================================
-   START DASHBOARD
+   START
 ========================================================= */
 
-function initializeDashboard() {
+async function initializeDashboard() {
+
+    initializeDemoHistory();
 
     drawAllCharts();
 
     updateUI();
 
-    showNormalStatus();
-
-    changeMode();
-
-    console.log(
-        "🛰️ ORBITAL SENTINEL INITIALIZED"
-    );
-
-    console.log(
-        "🟢 NORMAL → 🟡 WARNING → 🔴 ANOMALY → 🟡 RECOVERY → 🟢 NORMAL"
-    );
-
-
-    /*
-       Start the repeating demonstration.
-    */
-
-    startNormalPhase();
-
+    await loadRealMLData();
 }
-
 
 initializeDashboard();
